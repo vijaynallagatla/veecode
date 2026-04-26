@@ -4,10 +4,13 @@
  *--------------------------------------------------------------------------------------------*/
 
 import assert from 'assert';
-import { DisposableStore } from '../../../../../base/common/lifecycle.js';
+import { DisposableStore, Disposable } from '../../../../../base/common/lifecycle.js';
 import { URI } from '../../../../../base/common/uri.js';
 import { Emitter } from '../../../../../base/common/event.js';
-import { observableValue } from '../../../../../base/common/observable.js';
+import { constObservable, observableValue } from '../../../../../base/common/observable.js';
+import { IAgentHostTerminalService } from '../../../../../workbench/contrib/terminal/browser/agentHostTerminalService.js';
+import { ITerminalProfileService } from '../../../../../workbench/contrib/terminal/common/terminal.js';
+import { ISessionsProvidersService } from '../../../../services/sessions/browser/sessionsProvidersService.js';
 import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../../base/test/common/utils.js';
 import { mock } from '../../../../../base/test/common/mock.js';
 import { TestInstantiationService } from '../../../../../platform/instantiation/test/common/instantiationServiceMock.js';
@@ -16,8 +19,7 @@ import { ITerminalInstance, ITerminalService } from '../../../../../workbench/co
 import { ITerminalCapabilityStore, ICommandDetectionCapability, TerminalCapability } from '../../../../../platform/terminal/common/capabilities/capabilities.js';
 import { toAgentHostUri } from '../../../../../platform/agentHost/common/agentHostUri.js';
 import { AgentSessionProviders } from '../../../../../workbench/contrib/chat/browser/agentSessions/agentSessions.js';
-import { IActiveSession, ISessionsChangeEvent, ISessionsManagementService } from '../../../sessions/browser/sessionsManagementService.js';
-import { IChat, ISession } from '../../../sessions/common/sessionData.js';
+import { IChat, ISession } from '../../../../services/sessions/common/session.js';
 import { Codicon } from '../../../../../base/common/codicons.js';
 import { SessionsTerminalContribution } from '../../browser/sessionsTerminalContribution.js';
 import { TestPathService } from '../../../../../workbench/test/browser/workbenchTestServices.js';
@@ -25,6 +27,7 @@ import { IPathService } from '../../../../../workbench/services/path/common/path
 import { IContextKeyService } from '../../../../../platform/contextkey/common/contextkey.js';
 import { MockContextKeyService } from '../../../../../platform/keybinding/test/common/mockKeybindingService.js';
 import { IViewsService } from '../../../../../workbench/services/views/common/viewsService.js';
+import { IActiveSession, ISessionsChangeEvent, ISessionsManagementService } from '../../../../services/sessions/common/sessionsManagement.js';
 
 const HOME_DIR = URI.file('/home/user');
 
@@ -53,7 +56,6 @@ function makeAgentSession(opts: {
 		workingDirectory: opts.worktree,
 		detail: undefined,
 		baseBranchName: undefined,
-		baseBranchProtected: undefined,
 	} : undefined;
 	const chat: IChat = {
 		resource: URI.parse('file:///session'),
@@ -92,6 +94,7 @@ function makeAgentSession(opts: {
 		chats: observableValue('test.chats', [chat]),
 		activeChat: observableValue('test.activeChat', chat),
 		mainChat: chat,
+		capabilities: { supportsMultipleChats: false },
 	};
 	return session;
 }
@@ -102,7 +105,6 @@ function makeNonAgentSession(opts: { repository?: URI; worktree?: URI; providerT
 		workingDirectory: opts.worktree,
 		detail: undefined,
 		baseBranchName: undefined,
-		baseBranchProtected: undefined,
 	} : undefined;
 	const chat: IChat = {
 		resource: URI.parse('file:///session'),
@@ -140,6 +142,7 @@ function makeNonAgentSession(opts: { repository?: URI; worktree?: URI; providerT
 		gitHubInfo: observableValue('test.gitHubInfo', undefined),
 		chats: observableValue('test.chats', [chat]),
 		mainChat: chat,
+		capabilities: { supportsMultipleChats: false },
 	};
 	return session;
 }
@@ -270,6 +273,21 @@ suite('SessionsTerminalContribution', () => {
 
 		instantiationService.stub(IPathService, new TestPathService(HOME_DIR));
 
+		instantiationService.stub(IAgentHostTerminalService, new class extends mock<IAgentHostTerminalService>() {
+			override readonly profiles = constObservable<never[]>([]);
+			override getProfileForConnection() { return undefined; }
+			override setDefaultCwd(): void { /* noop */ }
+			override async createTerminalForEntry() { return undefined; }
+		});
+
+		instantiationService.stub(ITerminalProfileService, new class extends mock<ITerminalProfileService>() {
+			override overrideDefaultProfile() { return Disposable.None; }
+		});
+
+		instantiationService.stub(ISessionsProvidersService, new class extends mock<ISessionsProvidersService>() {
+			override getProvider() { return undefined; }
+		});
+
 		instantiationService.stub(IContextKeyService, store.add(new MockContextKeyService()));
 
 		instantiationService.stub(IViewsService, new class extends mock<IViewsService>() {
@@ -301,6 +319,28 @@ suite('SessionsTerminalContribution', () => {
 	test('falls back to repository when worktree is undefined for a background session', async () => {
 		const repoUri = URI.file('/repo');
 		const session = makeAgentSession({ repository: repoUri, providerType: AgentSessionProviders.Background });
+		activeSessionObs.set(session, undefined);
+		await tick();
+
+		assert.strictEqual(createdTerminals.length, 1);
+		assert.strictEqual(createdTerminals[0].cwd.fsPath, repoUri.fsPath);
+	});
+
+	// --- Claude provider: also uses worktree/repository path ---
+
+	test('creates a terminal at the worktree for a Claude session', async () => {
+		const worktreeUri = URI.file('/worktree');
+		const session = makeAgentSession({ worktree: worktreeUri, repository: URI.file('/repo'), providerType: AgentSessionProviders.Claude });
+		activeSessionObs.set(session, undefined);
+		await tick();
+
+		assert.strictEqual(createdTerminals.length, 1);
+		assert.strictEqual(createdTerminals[0].cwd.fsPath, worktreeUri.fsPath);
+	});
+
+	test('falls back to repository when worktree is undefined for a Claude session', async () => {
+		const repoUri = URI.file('/repo');
+		const session = makeAgentSession({ repository: repoUri, providerType: AgentSessionProviders.Claude });
 		activeSessionObs.set(session, undefined);
 		await tick();
 
@@ -451,6 +491,7 @@ suite('SessionsTerminalContribution', () => {
 		const session = makeAgentSession({
 			isArchived: true,
 			worktree: worktreeUri,
+			providerType: AgentSessionProviders.Background,
 		});
 		onDidChangeSessions.fire({ added: [], removed: [], changed: [session] });
 		await tick();
@@ -483,13 +524,29 @@ suite('SessionsTerminalContribution', () => {
 		assert.strictEqual(disposedInstances.length, 0);
 	});
 
+	test('closes terminals when archived session has only a repository (no worktree)', async () => {
+		const repoUri = URI.file('/repo');
+		const session = makeAgentSession({ repository: repoUri, providerType: AgentSessionProviders.Background, isArchived: false });
+		activeSessionObs.set(session, undefined);
+		await tick();
+
+		assert.strictEqual(createdTerminals.length, 1);
+		assert.strictEqual(createdTerminals[0].cwd.fsPath, repoUri.fsPath);
+
+		const archivedSession = makeAgentSession({ repository: repoUri, providerType: AgentSessionProviders.Background, isArchived: true });
+		onDidChangeSessions.fire({ added: [], removed: [], changed: [archivedSession] });
+		await tick();
+
+		assert.strictEqual(disposedInstances.length, 1);
+	});
+
 	test('closes terminals when session is removed', async () => {
 		const worktreeUri = URI.file('/worktree');
 		await contribution.ensureTerminal(worktreeUri, false);
 
 		assert.strictEqual(createdTerminals.length, 1);
 
-		const session = makeAgentSession({ worktree: worktreeUri });
+		const session = makeAgentSession({ worktree: worktreeUri, providerType: AgentSessionProviders.Background });
 		onDidChangeSessions.fire({ added: [], removed: [session], changed: [] });
 		await tick();
 
@@ -700,14 +757,14 @@ suite('SessionsTerminalContribution', () => {
 
 	// --- Remote agent host sessions ---
 
-	test('falls back to home directory for a background session with a remote agent host repository', async () => {
+	test('uses the unwrapped repository path for a background session with a remote agent host repository', async () => {
 		const remoteRepoUri = toAgentHostUri(URI.file('/Users/user/repo'), 'my-server');
 		const session = makeAgentSession({ repository: remoteRepoUri, providerType: AgentSessionProviders.Background });
 		activeSessionObs.set(session, undefined);
 		await tick();
 
-		assert.strictEqual(createdTerminals.length, 1, 'should create a terminal at the home directory');
-		assert.strictEqual(createdTerminals[0].cwd.fsPath, HOME_DIR.fsPath);
+		assert.strictEqual(createdTerminals.length, 1, 'should create a terminal at the unwrapped repository path');
+		assert.strictEqual(createdTerminals[0].cwd.fsPath, URI.file('/Users/user/repo').fsPath);
 	});
 });
 

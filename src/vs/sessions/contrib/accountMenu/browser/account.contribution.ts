@@ -8,7 +8,8 @@ import './media/accountWidget.css';
 import './media/accountTitleBarWidget.css';
 import '../../../../workbench/contrib/chat/browser/chatStatus/media/chatStatus.css';
 import Severity from '../../../../base/common/severity.js';
-import { Disposable, DisposableStore, MutableDisposable } from '../../../../base/common/lifecycle.js';
+import { Disposable, DisposableStore, MutableDisposable, toDisposable } from '../../../../base/common/lifecycle.js';
+import { Event } from '../../../../base/common/event.js';
 import { localize, localize2 } from '../../../../nls.js';
 import { Action2, MenuRegistry, registerAction2, IMenuService, MenuId } from '../../../../platform/actions/common/actions.js';
 import { ContextKeyExpr, IContextKeyService } from '../../../../platform/contextkey/common/contextkey.js';
@@ -28,21 +29,27 @@ import { Codicon } from '../../../../base/common/codicons.js';
 import { IUpdateService, State, StateType } from '../../../../platform/update/common/update.js';
 import { IHoverService } from '../../../../platform/hover/browser/hover.js';
 import { IProductService } from '../../../../platform/product/common/productService.js';
-import { IOpenerService } from '../../../../platform/opener/common/opener.js';
 import { IDialogService } from '../../../../platform/dialogs/common/dialogs.js';
 import { IHostService } from '../../../../workbench/services/host/browser/host.js';
+import { IOpenerService } from '../../../../platform/opener/common/opener.js';
 import { URI } from '../../../../base/common/uri.js';
+import { isWindows, isMacintosh } from '../../../../base/common/platform.js';
 import { UpdateHoverWidget } from './updateHoverWidget.js';
-import { ChatEntitlementService, IChatEntitlementService } from '../../../../workbench/services/chat/common/chatEntitlementService.js';
+import { ChatEntitlement, ChatEntitlementService, IChatEntitlementService } from '../../../../workbench/services/chat/common/chatEntitlementService.js';
 import { ChatStatusDashboard } from '../../../../workbench/contrib/chat/browser/chatStatus/chatStatusDashboard.js';
 import { HoverPosition } from '../../../../base/browser/ui/hover/hoverWidget.js';
 import { ThemeIcon } from '../../../../base/common/themables.js';
-import { getAccountTitleBarBadgeKey, getAccountTitleBarState } from './accountTitleBarState.js';
+import { getAccountProfileImageUrl, getAccountTitleBarBadgeKey, getAccountTitleBarState } from './accountTitleBarState.js';
 import { SessionsWelcomeVisibleContext } from '../../../common/contextkeys.js';
 import { IsAuxiliaryWindowContext } from '../../../../workbench/common/contextkeys.js';
 import { IAuthenticationAccessService } from '../../../../workbench/services/authentication/browser/authenticationAccessService.js';
 import { IAuthenticationUsageService } from '../../../../workbench/services/authentication/browser/authenticationUsageService.js';
 import { IAuthenticationService } from '../../../../workbench/services/authentication/common/authentication.js';
+import { resetSessionsWelcome } from '../../welcome/browser/welcome.contribution.js';
+import { IStorageService } from '../../../../platform/storage/common/storage.js';
+import { IWorkbenchLayoutService } from '../../../../workbench/services/layout/browser/layoutService.js';
+import { IWorkbenchEnvironmentService } from '../../../../workbench/services/environment/common/environmentService.js';
+import { ILogService } from '../../../../platform/log/common/log.js';
 
 // --- Account Menu Items --- //
 const AccountMenu = new MenuId('SessionsAccountMenu');
@@ -116,25 +123,27 @@ async function runSessionsUpdateAction(
 	dialogService: IDialogService,
 	hostService: IHostService,
 ): Promise<void> {
-	if (state.type === StateType.AvailableForDownload && state.canInstall === false) {
-		const { confirmed } = await dialogService.confirm({
-			message: localize('sessionsUpdateFromVSCode.title', "Update from VS Code"),
-			detail: localize('sessionsUpdateFromVSCode.detail', "This will close the Agents app and open VS Code so you can install the update.\n\nLaunch Agents again after the update is complete."),
-			primaryButton: localize('sessionsUpdateFromVSCode.open', "Close and Open VS Code"),
-		});
+	if (state.type === StateType.AvailableForDownload) {
+		const isInsiderOrExploration = productService.quality === 'insider' || productService.quality === 'exploration';
+		const hasCrossAppCoordinator = (isWindows || isMacintosh) && isInsiderOrExploration;
+		if (!hasCrossAppCoordinator) {
+			const { confirmed } = await dialogService.confirm({
+				message: localize('sessionsUpdateFromVSCode.title', "Update from VS Code"),
+				detail: localize('sessionsUpdateFromVSCode.detail', "This will close the Agents app and open VS Code so you can install the update.\n\nLaunch Agents again after the update is complete."),
+				primaryButton: localize('sessionsUpdateFromVSCode.open', "Close and Open VS Code"),
+			});
 
-		if (confirmed) {
-			await openerService.open(URI.from({
-				scheme: productService.urlProtocol,
-				query: 'windowId=_blank',
-			}), { openExternal: true });
-			await hostService.close();
+			if (confirmed) {
+				await openerService.open(URI.from({
+					scheme: productService.urlProtocol,
+					query: 'windowId=_blank',
+				}), { openExternal: true });
+				await hostService.shutdown();
+			}
+
+			return;
 		}
 
-		return;
-	}
-
-	if (state.type === StateType.AvailableForDownload) {
 		await updateService.downloadUpdate(true);
 		return;
 	}
@@ -147,6 +156,22 @@ async function runSessionsUpdateAction(
 	if (state.type === StateType.Downloaded) {
 		await updateService.applyUpdate();
 	}
+}
+
+export async function showSessionsWelcomeAfterSignOut(
+	chatEntitlementService: Pick<IChatEntitlementService, 'entitlement' | 'onDidChangeEntitlement'>,
+	resetWelcome: () => void,
+): Promise<void> {
+	const waitForUnknownEntitlement = Event.toPromise(Event.filter(chatEntitlementService.onDidChangeEntitlement, () => chatEntitlementService.entitlement === ChatEntitlement.Unknown));
+	try {
+		if (chatEntitlementService.entitlement !== ChatEntitlement.Unknown) {
+			await waitForUnknownEntitlement;
+		}
+	} finally {
+		waitForUnknownEntitlement.cancel();
+	}
+
+	resetWelcome();
 }
 
 // Sign In (shown when signed out)
@@ -189,6 +214,13 @@ registerAction2(class extends Action2 {
 		const authenticationService = accessor.get(IAuthenticationService);
 		const authenticationUsageService = accessor.get(IAuthenticationUsageService);
 		const authenticationAccessService = accessor.get(IAuthenticationAccessService);
+		const chatEntitlementService = accessor.get(IChatEntitlementService);
+		const storageService = accessor.get(IStorageService);
+		const instantiationService = accessor.get(IInstantiationService);
+		const layoutService = accessor.get(IWorkbenchLayoutService);
+		const contextKeyService = accessor.get(IContextKeyService);
+		const environmentService = accessor.get(IWorkbenchEnvironmentService);
+		const logService = accessor.get(ILogService);
 		const defaultAccount = await defaultAccountService.getDefaultAccount();
 		if (!defaultAccount) {
 			return;
@@ -212,6 +244,7 @@ registerAction2(class extends Action2 {
 		await Promise.all(sessions.map(session => authenticationService.removeSession(providerId, session.id)));
 		authenticationUsageService.removeAccountUsage(providerId, accountLabel);
 		authenticationAccessService.removeAllowedExtensions(providerId, accountLabel);
+		await showSessionsWelcomeAfterSignOut(chatEntitlementService, () => resetSessionsWelcome(storageService, instantiationService, layoutService, chatEntitlementService, contextKeyService, environmentService, logService));
 	}
 });
 
@@ -231,19 +264,25 @@ registerUpdateMenuItems(AccountMenu, '3_updates');
 class TitleBarAccountWidget extends BaseActionViewItem {
 
 	private container: HTMLElement | undefined;
+	private avatarElement: HTMLImageElement | undefined;
 	private iconElement: HTMLElement | undefined;
 	private labelElement: HTMLElement | undefined;
 	private badgeElement: HTMLElement | undefined;
 	private accountName: string | undefined;
+	private accountProviderId: string | undefined;
 	private accountProviderLabel: string | undefined;
 	private isAccountLoading = true;
 	private accountRequestCounter = 0;
+	private avatarRequestCounter = 0;
+	private currentAvatarUrl: string | undefined;
+	private loadedAvatarUrl: string | undefined;
 	private lastState: ReturnType<typeof getAccountTitleBarState>;
 	private isMenuVisible = false;
 	private lastBadgeKey: string | undefined;
 	private dismissedBadgeKey: string | undefined;
 	private readonly copilotDashboardStore = this._register(new MutableDisposable<DisposableStore>());
 	private readonly clickPanelDisposable = this._register(new MutableDisposable<DisposableStore>());
+	private readonly avatarLoadDisposable = this._register(new MutableDisposable());
 
 	constructor(
 		action: IAction,
@@ -271,12 +310,22 @@ class TitleBarAccountWidget extends BaseActionViewItem {
 		this.refreshAccount();
 	}
 
+	override setFocusable(_focusable: boolean): void {
+		// Don't let the ActionBar remove focusability - this widget must
+		// always be reachable via Tab even when a sibling item is hidden.
+	}
+
 	override render(container: HTMLElement): void {
 		super.render(container);
 
 		this.container = container;
 		container.classList.add('sessions-account-titlebar-widget');
+		container.setAttribute('role', 'button');
+		container.tabIndex = 0;
 
+		this.avatarElement = append(container, $('img.sessions-account-titlebar-widget-avatar', { alt: localize('accountAvatarAltFallback', "Account profile image"), draggable: 'false' })) as HTMLImageElement;
+		this.avatarElement.decoding = 'async';
+		this.avatarElement.referrerPolicy = 'no-referrer';
 		this.iconElement = append(container, $('.sessions-account-titlebar-widget-icon'));
 		this.labelElement = append(container, $('span.sessions-account-titlebar-widget-label'));
 		this.badgeElement = append(container, $('span.sessions-account-titlebar-widget-badge'));
@@ -303,13 +352,15 @@ class TitleBarAccountWidget extends BaseActionViewItem {
 		}
 
 		this.accountName = account?.accountName;
+		this.accountProviderId = account?.authenticationProvider.id;
 		this.accountProviderLabel = account?.authenticationProvider.name;
 		this.isAccountLoading = false;
+		this.refreshAvatar();
 		this.renderState();
 	}
 
 	private renderState(): void {
-		if (!this.container || !this.iconElement || !this.labelElement || !this.badgeElement) {
+		if (!this.container || !this.avatarElement || !this.iconElement || !this.labelElement || !this.badgeElement) {
 			return;
 		}
 
@@ -335,15 +386,84 @@ class TitleBarAccountWidget extends BaseActionViewItem {
 		}
 
 		const shouldShowDotBadge = !!badgeKey && badgeKey !== this.dismissedBadgeKey;
+		const loadedAvatarUrl = !this.isAccountLoading ? this.loadedAvatarUrl : undefined;
+		const hasLoadedAvatar = !!loadedAvatarUrl;
 		const titleBarIcon = state.dotBadge ? Codicon.account : state.icon;
 
+		this.avatarElement.classList.toggle('visible', hasLoadedAvatar);
+		this.avatarElement.alt = this.getAvatarAltText(hasLoadedAvatar);
+		if (hasLoadedAvatar) {
+			if (this.avatarElement.src !== loadedAvatarUrl) {
+				this.avatarElement.src = loadedAvatarUrl;
+			}
+		} else {
+			this.avatarElement.removeAttribute('src');
+		}
+
 		this.iconElement.className = `sessions-account-titlebar-widget-icon ${ThemeIcon.asClassName(titleBarIcon)}`;
+		this.iconElement.classList.toggle('hidden', hasLoadedAvatar);
 		this.labelElement.textContent = '';
 		this.badgeElement.textContent = '';
 		this.badgeElement.classList.toggle('dot-badge', shouldShowDotBadge);
 		this.badgeElement.classList.toggle('dot-badge-warning', shouldShowDotBadge && state.dotBadge === 'warning');
 		this.badgeElement.classList.toggle('dot-badge-error', shouldShowDotBadge && state.dotBadge === 'error');
 		this.badgeElement.style.display = shouldShowDotBadge ? '' : 'none';
+	}
+
+	private getAvatarAltText(hasLoadedAvatar: boolean): string {
+		if (hasLoadedAvatar && this.accountProviderId === 'github' && this.accountName) {
+			return localize('accountAvatarAlt', "GitHub profile image for {0}", this.accountName);
+		}
+
+		return localize('accountAvatarAltFallback', "Account profile image");
+	}
+
+	private refreshAvatar(): void {
+		const avatarUrl = getAccountProfileImageUrl(this.accountProviderId, this.accountName);
+		if (avatarUrl === this.currentAvatarUrl) {
+			return;
+		}
+
+		this.currentAvatarUrl = avatarUrl;
+		this.loadedAvatarUrl = undefined;
+		this.avatarLoadDisposable.clear();
+		const requestId = ++this.avatarRequestCounter;
+
+		if (!avatarUrl) {
+			this.renderState();
+			return;
+		}
+
+		const image = new Image();
+		image.referrerPolicy = 'no-referrer';
+		const clearHandlers = () => {
+			image.onload = null;
+			image.onerror = null;
+		};
+		image.onload = () => {
+			if (requestId !== this.avatarRequestCounter) {
+				return;
+			}
+
+			this.loadedAvatarUrl = avatarUrl;
+			this.renderState();
+			clearHandlers();
+		};
+		image.onerror = () => {
+			if (requestId !== this.avatarRequestCounter) {
+				return;
+			}
+
+			this.loadedAvatarUrl = undefined;
+			this.renderState();
+			clearHandlers();
+		};
+		this.avatarLoadDisposable.value = toDisposable(() => {
+			clearHandlers();
+			image.src = '';
+		});
+		image.src = avatarUrl;
+		this.renderState();
 	}
 
 	private getHoverTarget(): { targetElements: HTMLElement[]; x: number } {
@@ -385,6 +505,7 @@ class TitleBarAccountWidget extends BaseActionViewItem {
 				this.isMenuVisible = false;
 				this.container?.classList.remove('menu-visible');
 				this.renderState();
+				this.container?.focus();
 			}
 		});
 
@@ -545,7 +666,6 @@ class TitleBarAccountWidget extends BaseActionViewItem {
 			disableModelSelection: true,
 			disableProviderOptions: true,
 			disableCompletionsSnooze: true,
-			disableContributions: true,
 		});
 
 		store.add(disposableWindowInterval(mainWindow, () => {
@@ -585,6 +705,7 @@ class TitleBarUpdateWidget extends BaseActionViewItem {
 
 		this.container = container;
 		container.classList.add('sessions-update-titlebar-widget');
+		container.setAttribute('role', 'button');
 
 		this.labelElement = append(container, $('span.sessions-update-titlebar-widget-label'));
 		this.hoverAttachment.value = this.updateHoverWidget.attachTo(container);
@@ -636,6 +757,50 @@ class TitleBarUpdateWidget extends BaseActionViewItem {
 
 // --- Register custom view item --- //
 
+// These actions are registered at module level (not lazily inside AccountWidgetContribution)
+// so that Menus.TitleBarRightLayout is non-empty when the MenuWorkbenchToolBar is first
+// constructed. If they were registered lazily (WorkbenchPhase.AfterRestored), the toolbar's
+// IntersectionObserver would have already observed an empty, display:none container and
+// stopped listening for menu changes — causing the widgets to never appear.
+//
+// The actual widget rendering and interaction is handled by TitleBarUpdateWidget /
+// TitleBarAccountWidget, which are custom view items registered via IActionViewItemService
+// in AccountWidgetContribution. Those widgets attach their own DOM click handlers, so
+// run() here is intentionally a no-op.
+registerAction2(class extends Action2 {
+	constructor() {
+		super({
+			id: SessionsTitleBarUpdateWidgetAction,
+			title: localize2('agentsUpdateTitleBar', "Agents Update"),
+			menu: {
+				id: Menus.TitleBarRightLayout,
+				group: 'navigation',
+				order: 99,
+				when: ContextKeyExpr.and(IsAuxiliaryWindowContext.toNegated(), SessionsWelcomeVisibleContext.toNegated()),
+			}
+		});
+	}
+
+	run(): void { }
+});
+
+registerAction2(class extends Action2 {
+	constructor() {
+		super({
+			id: SessionsTitleBarAccountWidgetAction,
+			title: localize2('agentsAccountStatusTitleBar', "Agents Account and Status"),
+			menu: {
+				id: Menus.TitleBarRightLayout,
+				group: 'navigation',
+				order: 100,
+				when: IsAuxiliaryWindowContext.toNegated(),
+			}
+		});
+	}
+
+	run(): void { }
+});
+
 class AccountWidgetContribution extends Disposable implements IWorkbenchContribution {
 
 	static readonly ID = 'workbench.contrib.sessionsWidget';
@@ -651,48 +816,10 @@ class AccountWidgetContribution extends Disposable implements IWorkbenchContribu
 			return instantiationService.createInstance(TitleBarUpdateWidget, action, options);
 		}, undefined));
 
-		this._register(registerAction2(class extends Action2 {
-			constructor() {
-				super({
-					id: SessionsTitleBarUpdateWidgetAction,
-					title: localize2('agentsUpdateTitleBar', "Agents Update"),
-					menu: {
-						id: Menus.TitleBarRightLayout,
-						group: 'navigation',
-						order: 99,
-						when: ContextKeyExpr.and(IsAuxiliaryWindowContext.toNegated(), SessionsWelcomeVisibleContext.toNegated()),
-					}
-				});
-			}
-
-			async run(): Promise<void> {
-				// Handled by the custom view item
-			}
-		}));
-
 		// Titlebar account widget (rightmost in titlebar)
 		this._register(actionViewItemService.register(Menus.TitleBarRightLayout, SessionsTitleBarAccountWidgetAction, (action, options) => {
 			return instantiationService.createInstance(TitleBarAccountWidget, action, options);
 		}, undefined));
-
-		this._register(registerAction2(class extends Action2 {
-			constructor() {
-				super({
-					id: SessionsTitleBarAccountWidgetAction,
-					title: localize2('agentsAccountStatusTitleBar', "Agents Account and Status"),
-					menu: {
-						id: Menus.TitleBarRightLayout,
-						group: 'navigation',
-						order: 100,
-					}
-				});
-			}
-
-			async run(): Promise<void> {
-				// Handled by the custom view item
-			}
-		}));
-
 	}
 }
 
